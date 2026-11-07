@@ -15,6 +15,9 @@ pending.json.tmp
 outbox.json
 outbox.json.tmp
 forward_seen.json
+media_send_journal.json
+media_send_journal.json.tmp
+media_send_journal.json.lock
 history.log
 forward.heartbeat
 

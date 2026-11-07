@@ -77,6 +77,20 @@
 - 判断成功不能看 HTTP 状态码：iLink 拒绝时也返回 200，要看 JSON 里的 `ret` / `errcode`。
 - 只有发送成功的文本才写进 `history.log`。
 
+### 出站图片 / 文件
+文本命令完全不变，仍然走 `outbox.send_or_queue`。图片和文件是另一条命令，**不进 outbox**，失败也不会由 `forward.py` 重试（避免网络不确定时发重）：
+
+```bash
+python3 send.py --image photo.jpg --caption "图" --reply-to-ms <trigger_ms>
+python3 send.py --file notes.pdf --reply-to-ms <trigger_ms>
+```
+
+- `--image`：`.jpg` / `.jpeg` / `.png` / `.gif` / `.webp`。校验扩展名和魔数后按原字节 AES-128-ECB 加密上传，**不转码、不抽帧、不生成缩略图**。动图字节会原样上传；协议没有“是否播放动画”的字段，微信图片气泡是否动画、会不会再压缩，发送方无法保证。要保住原始容器，用 `--file`。
+- `--file`：`.pdf` / `.doc` / `.docx` / `.zip` 会核对魔数；其他普通文件按附件发送（`media_type=3`）。拒绝空文件、目录、以及 `credentials.json` / `.env` / `state.json` 这类运行时文件。
+- 官方协议文档**没有写上传大小上限**。默认本地护栏 20 MiB（`WECHAT_MEDIA_MAX_BYTES`，最大 100 MiB），这不是 iLink 公布的限制。
+- 退出码：**0** API 已接受（不是送达）、**2** 参数或文件不合法、**4** 被新消息取代、**5** 明确拒绝（可以再试）、**6** 结果不确定或被拦住以免重发。媒体没有退出码 3。
+- `ret=0` / 空错误码只表示 `sendmessage` 接受了请求。响应该协议没有送达回执或已读回执。`client_id` 是本机相关 id，`server_message_id` 只有响应里真有 `message_id` 才打印。
+
 ### 24 小时推送窗口 + keep-alive nudge + 免打扰
 微信只允许 bot 在用户最后一次发言后的一段时间内主动发消息（实测 11h 能发、35h 失败，按 ~24h 处理）。
 所以 `outbox.py` 在窗口快关时发一条很短的续期提醒（文案可在 `NUDGE_TEXT` 改）：
@@ -141,7 +155,8 @@ cp .env.example .env            # 先空着 webhook，下一步再填
 |---|---|
 | `forward.py` | 常驻转发器：轮询、去重、媒体、批处理 POST、outbox 线程 |
 | `outbox.py` | 推送失败排队 / 补发、keep-alive nudge、免打扰 |
-| `send.py` | agent 用的发送命令（可打断、排队）|
+| `send.py` | agent 用的发送命令。文本：可打断、排队。图片/文件：见「出站图片 / 文件」|
+| `media_send.py` | 出站图片/文件：加密、上传、发送、不确定结果去重。不参与收消息和 nudge |
 | `ilink.py` | 最小 iLink 客户端（`post` / `send_text` / state 读写）|
 | `media.py` | 媒体摘要、CDN 下载、AES 解密 |
 | `history.py` | 滚动对话记录 `history.log`（2000 行时截到 1000）|
@@ -192,10 +207,15 @@ webhook routine, so WeChat becomes a chat front-end for your agent.
 - **Inbound**: `forward.py` long-polls `ilink/bot/getupdates`, dedupes, downloads + AES-128-ECB-decrypts media from the
   WeChat CDN, buffers messages in a disk-backed `pending.json`, and POSTs them as **one batch** once you pause (3s) or after 60s,
   together with the last 40 lines of a stitched `history.log` (each webhook run is a fresh agent run).
-- **Outbound**: the agent replies with `send.py "text" --reply-to-ms <trigger_ms>`. If you've sent something newer
+- **Outbound text**: the agent replies with `send.py "text" --reply-to-ms <trigger_ms>`. If you've sent something newer
   meanwhile, it exits **4 (SUPERSEDED)** and sends nothing — replies are interruptible. If WeChat refuses (the ~24h
   push window since your last message has closed; note iLink still returns HTTP 200, check `ret`/`errcode`), the text
   is queued in `outbox.json` (exit **3**) and auto-sent right after you next write.
+- **Outbound image/file**: `send.py --image photo.jpg` or `send.py --file notes.pdf`. JPG, PNG, GIF, and WEBP go out as
+  image items; PDF, DOC, DOCX, ZIP, and other ordinary files go out as file items. Bytes are AES-128-ECB encrypted and
+  uploaded the way `@tencent-weixin/openclaw-weixin` documents (`getuploadurl`, CDN `POST`, `sendmessage`). Nothing is
+  transcoded. Exit **0** means the API accepted the request, not that the phone displayed it — `sendmessage` has no
+  delivery or read receipt. An ambiguous network error exits **6** and will not automatically retry.
 - **Keep-alive nudge**: one short "reply 1 to renew" message 18–23h after your last message, never during quiet
   hours (00:00–07:59 Beijing); if that slot is all quiet hours, it's sent early (≥12h) 30 min before quiet hours start.
   A bare "1" gets a `context_note` so the agent just acks it.
